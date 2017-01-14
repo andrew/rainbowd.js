@@ -1,10 +1,15 @@
 # rainbowd.js
 
-**THIS IS ALPHA, NOT SUITABLE FOR PRODUCTION USE.** A small reverse proxy that
-allows dynamic apps on simple setups to have zero-downtime deploys. Don't be
-jealous of PHP anymore!
+Painless
+[blue-green deploys](https://martinfowler.com/bliki/BlueGreenDeployment.html)
+for simple setups.  A small reverse proxy that manages gracefully moving traffic
+to new processes.
+
+This is still in alpha stages, so proceed at your own risk!
 
 No current plans to support websockets.
+
+Based on [node-http-proxy](https://github.com/nodejitsu/node-http-proxy).
 
 ## Usage
 
@@ -22,11 +27,23 @@ It will launch the service on a new port, only send new connections to the new
 service, and send SIGTERM to the old service, which hopefully will trigger a
 graceful shutdown.
 
-# TODO
+This is intended to run beind another reverse proxy.  The idea is if you're
+already pointing e.g. Apache or Nginx to your backend servers, you point them to
+rainbowd.js instead and rainbowd.js will take care of doing the blue/green
+deploys.  In fact, rainbow.d can keep multiple old versions alive if they have
+long running requests and the deploys are close enough together.  This is where
+the name comes from -- green-blue-red-orange-yellow deploys!
 
-- [ ] Diagnose and fix the few erroneous connections that occur during
-  deploys. `wrk` will get 3 or 4 broken responses out of the thousands it runs
-  during a redeploy of the test [Flask](http://flask.pocoo.org/) app.
+**NOTE:** It's critical the warmup time is large enough!  If it's not you may
+drop requests during the deploy, which defeats the whole purpose of this server.
+I suggest doing deploys with a tool like [wrk](https://github.com/wg/wrk) to
+make sure your deploys are really safe.
+
+## TODO
+
+- [ ] Test with various Python and Ruby servers.
+- [ ] Command-line flag for config file
 - [ ] Allow control and server port/addr to be configurable
-- [ ] Test with other Python and Ruby servers.
-- [ ] Flag for config file
+- [ ] Allow a touch file for redeploy to make redeploy easier/more secure
+- [ ] Allow disabling REST API
+- [ ] Use health checks instead of warmup time to determine when to do cutover
