@@ -28,9 +28,8 @@ function launchBackend() {
       process.exit(1)
     }
 
-    server_port = port
     var self = child_process.exec(
-      config.run + ' ' + server_port, {}, (error, stdout, stderr) => {
+      config.run + ' ' + port, {}, (error, stdout, stderr) => {
         if (error) {
           console.error('Error running the backend:', error)
           process.exit(1)
@@ -45,15 +44,26 @@ function launchBackend() {
         }
       }
     )
-    server_process = self
 
-    if (old_backend !== null) {
+    // Wait for the new process to come online
+    // TODO: make this better... add retries and timeouts or something
+    // maybe for x seconds until there's 3 OK checks in a row?
+    setTimeout(() => {
+      http.request({host: 'localhost', path: '/', port: port}, (response) => {
+        // TODO: Check response status code?
+        console.info('Switching to backend at port ' + port)
+        server_port = port
+        server_process = self
 
-      // TODO: check it actually dies (this sends SIGTERM)
-      old_backend.time_to_die = true
-      old_backend.kill()
-      console.info('Killing', old_backend.pid)
-    }
+        if (old_backend !== null) {
+
+          // TODO: check it actually dies (this sends SIGTERM)
+          old_backend.time_to_die = true
+          old_backend.kill()
+          console.info('Killing', old_backend.pid)
+        }
+      }).end()
+    }, config.warmup_time || 1000)
   })
 }
 
@@ -63,6 +73,8 @@ var server = http.createServer((req, res) => {
     throw "The port is unkonwn (backend is most likely not running)"
   }
   proxy.web(req, res, {target: 'http://localhost:' + server_port})
+}).on('error', (err, req, res) => {
+  console.error("Unexpected error:", err)
 })
 
 var controlServer = express()
