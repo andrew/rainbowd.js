@@ -2,10 +2,10 @@
   "name": "rainbowd.js",
   "version": "1.0.0",
   "description": "",
-  "main": "index.js",
+  "main": "rainbowd.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "main": "node index.js"
+    "main": "node rainbowd.js"
   },
   "author": "",
   "license": "ISC",

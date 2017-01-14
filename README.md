@@ -28,11 +28,11 @@ service, and send SIGTERM to the old service, which hopefully will trigger a
 graceful shutdown.
 
 This is intended to run beind another reverse proxy.  The idea is if you're
-already pointing e.g. Apache or Nginx to your backend servers, you point them to
-rainbowd.js instead and rainbowd.js will take care of doing the blue/green
-deploys.  In fact, rainbow.d can keep multiple old versions alive if they have
+already pointing e.g. Apache or Nginx to your app server, you point them to
+rainbowd.js instead and rainbowd.js will take care of doing rolling deploys of
+your app.  In fact, rainbowd can keep multiple old versions alive if they have
 long running requests and the deploys are close enough together.  This is where
-the name comes from -- green-blue-red-orange-yellow deploys!
+the name comes from: green-blue-red-orange-yellow deploys!
 
 **NOTE:** It's critical the warmup time is large enough!  If it's not you may
 drop requests during the deploy, which defeats the whole purpose of this server.
