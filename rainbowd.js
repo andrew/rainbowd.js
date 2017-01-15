@@ -1,3 +1,5 @@
+"use strict"
+
 var child_process = require('child_process')
 var fs = require('fs')
 var http = require('http')
@@ -10,8 +12,7 @@ let config_path = 'rainbow.conf.json'
 
 // global vars (I know, I'm a bad man)
 var config = {}
-var server_process = null
-var server_port = null;
+var backend = null
 var proxy = httpProxy.createProxyServer()
 
 proxy.on('error', (err, req, res) => {
@@ -20,84 +21,163 @@ proxy.on('error', (err, req, res) => {
 })
 
 
+/**
+ * Spams GET requests at the backend until 3 pass in a row.
+ */
+function healthCheckCutover(backendPort, path, timeout, cutover) {
+  var successfulChecks = 0
+  var attemptedChecks = 0
+  var cutoverStarted = false
+  var request = null;
+
+  function startCutover() {
+    if (!cutoverStarted) {
+      cutoverStarted = true
+      request.end()
+      cutover()
+    }
+  }
+
+  function check() {
+    if (cutoverStarted) {
+      return
+    }
+    var req = http.get("http://localhost:" + backendPort + path,
+                       successfulCheck).on('error', failedCheck)
+    if (request == null) {
+      request = req
+    }
+  }
+
+  function successfulCheck() {
+    successfulChecks++
+    attemptedChecks++
+    if (successfulChecks >= 3) {
+      console.log("3 checks passed (" + attemptedChecks + " checks made)")
+      startCutover()
+    } else {
+      check()
+    }
+  }
+
+  function failedCheck() {
+    successfulChecks = 0  // want 3 in a row
+    attemptedChecks++
+    check()
+  }
+
+  // Iif the health checks are taking too long, start anyway.
+  // Timeout should be something long like 15s
+  setTimeout(() => {
+    if (!cutoverStarted) {
+      console.warn("Timeout passed for checks, cutting over anyway...")
+      startCutover()
+    }
+  }, timeout)
+  check()
+}
+
 function launchBackend() {
-  var old_backend = server_process
+  var old_backend = backend
   portfinder.getPort((err, port) => {
     if (err) {
       console.error("Couldn't find a port:", err)
       process.exit(1)
     }
 
-    var self = child_process.exec(
-      config.run + ' ' + port, {}, (error, stdout, stderr) => {
+    var self = {
+      pidfile: child_process.execSync('mktemp').toString().trim(),
+      port: port
+    }
+    self.process = child_process.exec(
+      config.run + ' ' + port + ' ' + self.pidfile,
+      {},
+      (error, stdout, stderr) => {
         if (error) {
           console.error('Error running the backend:', error)
           process.exit(1)
-        } else if (!self.time_to_die) {
+        } else if (!self.timeToDie) {
           console.error('Backend exited abnormally. Stdout:')
           console.error(stdout)
           console.error('Stderr:')
           console.error(stderr)
           process.exit(1)
         } else {
-          console.info(self.pid + ' killed')
+          console.info(self.pidfile + ' killed')
         }
       }
     )
 
-    // Wait for the new process to come online
-    // TODO: make this better... add retries and timeouts or something
-    // maybe for x seconds until there's 3 OK checks in a row?
-    setTimeout(() => {
-      http.request({host: 'localhost', path: '/', port: port}, (response) => {
-        // TODO: Check response status code?
-        console.info('Switching to backend at port ' + port)
-        server_port = port
-        server_process = self
+    function cutover() {
+      console.info('Switching to backend at port ' + self.port)
+      backend = self
 
-        if (old_backend !== null) {
+      if (old_backend !== null) {
 
-          // TODO: check it actually dies (this sends SIGTERM)
-          old_backend.time_to_die = true
-          old_backend.kill()
-          console.info('Killing', old_backend.pid)
-        }
-      }).end()
-    }, config.warmup_time || 1000)
+        // TODO: check it actually dies (this sends SIGTERM)
+        old_backend.timeToDie = true
+        console.info('Killing ' + old_backend.pidfile)
+        console.info('This is different from ' + backend.pidfile + ', right?')
+        child_process.execSync('pkill -TERM -F ' + old_backend.pidfile)
+      }
+    }
+
+    if (config.healthCheckPath) {
+      healthCheckCutover(port, config.healthCheckPath, 15000, cutover)
+    } else if (config.warmupTime) {
+      setTimeout(cutover, config.warmupTime)
+    } else {
+      // should never happen - config should be validated earlier
+      console.error("No cutover strategy... cutting over in 15s!")
+      setTimeout(cutover, 15000)
+    }
   })
 }
 
 
 var server = http.createServer((req, res) => {
-  if (server_port === null) {
+  if (backend === null || backend.port === null) {
     throw "The port is unkonwn (backend is most likely not running)"
   }
-  proxy.web(req, res, {target: 'http://localhost:' + server_port})
+  proxy.web(req, res, {target: 'http://localhost:' + backend.port})
 }).on('error', (err, req, res) => {
   console.error("Unexpected error:", err)
 })
 
 var controlServer = express()
 controlServer.get('/', (req, res) => {
-  res.send('Current backend port: ' + server_port + '\n')
+  res.end('Current backend port: ' + backend.port + '\n')
+})
+controlServer.get('/pid', (req, res) => {
+  res.end('Current backend pidfile: ' + backend.pidfile + '\n')
 })
 controlServer.post('/redeploy/', (req, res) => {
   res.end('Redeploying...\n')
   launchBackend()
 })
 
+
+function die(msg) {
+  console.error(msg)
+  process.exit(1)
+}
+
+
 fs.readFile(config_path, null,  (err, data) => {
   if (err) {
-    console.error(`Couldn't read ${config_path}: ${err}`)
-    process.exit(1)
+    die("Couldn't read " + config_path + ": " + err)
   }
   try {
     config = JSON.parse(data)
   } catch (ex) {
-    console.error(`Couldn't parse ${config_path}: ${err}`)
-    process.exit(1)
+    die("Couldn't parse " + config_path + ": " + err)
   }
 
+  if (config.warmupTime && config.healthCheckPath) {
+    die("Set either warmupTime or healthCheckPath, not both")
+  } else if (!(config.warmupTime || config.healthCheckPath)) {
+    die("Need warmupTime or healthCheckPath")
+  }
   launchBackend()
   server.listen(7000)
   controlServer.listen(7001)
