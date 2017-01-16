@@ -9,6 +9,7 @@ var httpProxy = require('http-proxy')
 var portfinder = require('portfinder')
 
 let config_path = 'rainbow.conf.json'
+let CUTOVER_KILL_DELAY = 5000
 
 // global vars (I know, I'm a bad man)
 var config = {}
@@ -128,13 +129,15 @@ function launchBackend() {
       backend = self
       if (old_backend !== null) {
 
-        // TODO: check it actually dies (this sends SIGTERM)
-        old_backend.expectToDie = true
-        readFile(
-          old_backend.pidfile
+        // TODO: check it actually dies (SIGTERM can be ignored)
+        new Promise((resolve, reject) => {
+          setTimeout(() => resolve(), CUTOVER_KILL_DELAY)
+        }).then(() =>
+          readFile(old_backend.pidfile)
         ).then(data => {
           var pid = data.toString().trim()
           console.log('Sending TERM to ' + pid)
+          old_backend.expectToDie = true
           process.kill(pid, 'SIGTERM')
         }).catch(err => {
           var pidfile = old_backend.pidfile
