@@ -1,7 +1,7 @@
 {
   "name": "rainbowd",
   "version": "0.2.0",
-  "homepage": "https://github.com/dan-passaro/rainbowd.js"
+  "homepage": "https://github.com/dan-passaro/rainbowd.js",
   "description": "",
   "author": "Dan Passaro",
   "bugs": {"url": "https://github.com/dan-passaro/rainbowd.js/issues"},
