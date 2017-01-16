@@ -1,19 +1,23 @@
 {
   "name": "rainbowd",
   "version": "0.2.0",
+  "homepage": "https://github.com/dan-passaro/rainbowd.js"
   "description": "",
+  "author": "Dan Passaro",
+  "bugs": {"url": "https://github.com/dan-passaro/rainbowd.js/issues"},
+  "license": "ISC",
+
   "main": "rainbowd.js",
   "scripts": {
     "main": "node rainbowd.js"
   },
-  "author": "Dan Passaro",
-  "license": "ISC",
+  "bin": {
+    "rainbowd.js": "rainbowd.js"
+  },
+
   "dependencies": {
     "express": "latest"
     ,"http-proxy": "latest"
     ,"portfinder": "latest"
-  },
-  "bin": {
-    "rainbowd.js": "rainbowd.js"
   }
 }
