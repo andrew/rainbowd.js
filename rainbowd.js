@@ -166,6 +166,11 @@ function launchBackend() {
       })
 
       backend = self
+      if (server.listeners('request').indexOf(serveUnavailable) >= 0) {
+        server.removeListener('request', serveUnavailable)
+        server.on('request', serveBackend)
+      }
+
       if (old_backend !== null) {
 
         // TODO: check it actually dies (SIGTERM can be ignored)
@@ -199,14 +204,19 @@ function launchBackend() {
 }
 
 
-var server = http.createServer((req, res) => {
-  if (backend) {
-    proxy.web(req, res, {target: 'http://localhost:' + backend.port})
-  } else {
-    res.statusCode = 503
-    res.end("Backend unavailable.\n")
-  }
-}).on('error', (err, req, res) => {
+function serveBackend(req, res) {
+  proxy.web(req, res, {target: 'http://localhost:' + backend.port})
+}
+
+function serveUnavailable(req, res) {
+  res.statusCode = 503
+  res.end("Backend unavailable.\n")
+}
+
+
+var server = http.createServer(
+  serveUnavailable
+).on('error', (err, req, res) => {
   console.error("Unexpected error:", err)
 })
 
