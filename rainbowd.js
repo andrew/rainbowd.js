@@ -33,6 +33,7 @@ function healthCheckCutover(backendPort, path, timeout, cutover) {
   var attemptedChecks = 0
   var cutoverStarted = false
   var request = null;
+  var cutoverCancelled = false
 
   function startCutover() {
     if (!cutoverStarted) {
@@ -43,7 +44,7 @@ function healthCheckCutover(backendPort, path, timeout, cutover) {
   }
 
   function check() {
-    if (cutoverStarted) {
+    if (cutoverCancelled || cutoverStarted) {
       return
     }
     var req = http.get("http://localhost:" + backendPort + path,
@@ -72,14 +73,30 @@ function healthCheckCutover(backendPort, path, timeout, cutover) {
 
   // Iif the health checks are taking too long, start anyway.
   // Timeout should be something long like 15s
-  setTimeout(() => {
+  var fallback = setTimeout(() => {
     if (!cutoverStarted) {
       console.warn("Timeout passed for checks, cutting over anyway...")
       startCutover()
     }
   }, timeout)
   check()
+
+  function cancel() {
+    cutoverCancelled = true
+    clearTimeout(fallback)
+  }
+  return cancel
 }
+
+
+function warmupTimeCutover(warmupTime, cutover) {
+  var timer = setTimeout(() => cutover(), warmupTime)
+  function cancel() {
+    clearTimeout(timer)
+  }
+  return cancel
+}
+
 
 function launchBackend() {
   if (backendCount >= BACKEND_LIMIT) {
@@ -94,22 +111,32 @@ function launchBackend() {
     }
 
     var self = {
+      dead: false,
+      expectToDie: false,
       pidfile: child_process.execSync('mktemp').toString().trim(),
       port: port
     }
     var cmd = config.run + ' ' + port + ' ' + self.pidfile
     self.process = child_process.exec(cmd, (error, stdout, stderr) => {
+      self.dead = true
       if (error) {
         console.error('Error running the backend:', error)
-        process.exit(1)
       } else if (!self.expectToDie) {
         console.error('Backend exited abnormally. Stdout:')
         console.error(stdout)
         console.error('Stderr:')
         console.error(stderr)
-        process.exit(1)
       } else {
         // console.info(`Backend at port ${self.port}, ${self.pidfile} killed`)
+      }
+
+      if (self.dead && backend === self) {
+        backend = null
+      }
+      if (cancelCutover) {
+        var msg = backend ? `, staying on port ${backend.port}` : ''
+        console.error('Backend launch failed' + msg)
+        cancelCutover()
       }
       backendCount--
     })
@@ -125,6 +152,12 @@ function launchBackend() {
     }
 
     function cutover() {
+
+      // Did the backend fail to start?  If so don't try to bring it online
+      if (self.dead) {
+        return
+      }
+
       readFile(
         self.pidfile
       ).then(pidBuffer => {
@@ -152,24 +185,27 @@ function launchBackend() {
       }
     }
 
+    var cancelCutover = null
     if (config.healthCheckPath) {
-      healthCheckCutover(port, config.healthCheckPath, 15000, cutover)
+      cancelCutover = healthCheckCutover(port, config.healthCheckPath, 15000, cutover)
     } else if (config.warmupTime) {
-      setTimeout(cutover, config.warmupTime)
+      cancelCutover = warmupTimeCutover(config.warmupTime, cutover)
     } else {
       // should never happen - config should be validated earlier
       console.error("No cutover strategy... cutting over in 15s!")
-      setTimeout(cutover, 15000)
+      cancelCutover = warmupTimeCutover(15000, cutover)
     }
   })
 }
 
 
 var server = http.createServer((req, res) => {
-  if (backend === null || backend.port === null) {
-    throw "The port is unkonwn (backend is most likely not running)"
+  if (backend) {
+    proxy.web(req, res, {target: 'http://localhost:' + backend.port})
+  } else {
+    res.statusCode = 503
+    res.end("Backend unavailable.\n")
   }
-  proxy.web(req, res, {target: 'http://localhost:' + backend.port})
 }).on('error', (err, req, res) => {
   console.error("Unexpected error:", err)
 })
