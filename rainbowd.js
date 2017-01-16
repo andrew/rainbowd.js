@@ -96,29 +96,50 @@ function launchBackend() {
         if (error) {
           console.error('Error running the backend:', error)
           process.exit(1)
-        } else if (!self.timeToDie) {
+        } else if (!self.expectToDie) {
           console.error('Backend exited abnormally. Stdout:')
           console.error(stdout)
           console.error('Stderr:')
           console.error(stderr)
           process.exit(1)
         } else {
-          console.info(self.pidfile + ' killed')
+          // console.info(`Backend at port ${self.port}, ${self.pidfile} killed`)
         }
       }
     )
 
-    function cutover() {
-      console.info('Switching to backend at port ' + self.port)
-      backend = self
+    // A promise version of fs.readFile
+    function readFile(path) {
+      return new Promise((resolve, reject) => {
+        fs.readFile(path, (err, data) => {
+          err ? reject(err) : resolve(data)
+        })
+      })
+    }
 
+    function cutover() {
+      readFile(
+        self.pidfile
+      ).then(pidBuffer => {
+        var pid = pidBuffer.toString().trim()
+        console.info(`Switching to backend at port ${self.port}, pid ${pid}`)
+      })
+
+      backend = self
       if (old_backend !== null) {
 
         // TODO: check it actually dies (this sends SIGTERM)
-        old_backend.timeToDie = true
-        console.info('Killing ' + old_backend.pidfile)
-        console.info('This is different from ' + backend.pidfile + ', right?')
-        child_process.execSync('pkill -TERM -F ' + old_backend.pidfile)
+        old_backend.expectToDie = true
+        readFile(
+          old_backend.pidfile
+        ).then(data => {
+          var pid = data.toString().trim()
+          console.log('Sending TERM to ' + pid)
+          process.kill(pid, 'SIGTERM')
+        }).catch(err => {
+          var pidfile = old_backend.pidfile
+          console.error(`Couldn't kill backend at ${pidfile}: ${err}`)
+        })
       }
     }
 
