@@ -10,10 +10,12 @@ var portfinder = require('portfinder')
 
 let config_path = 'rainbow.conf.json'
 let CUTOVER_KILL_DELAY = 5000
+let BACKEND_LIMIT = 10
 
 // global vars (I know, I'm a bad man)
 var config = {}
 var backend = null
+var backendCount = 0
 var proxy = httpProxy.createProxyServer()
 
 proxy.on('error', (err, req, res) => {
@@ -79,6 +81,10 @@ function healthCheckCutover(backendPort, path, timeout, cutover) {
 }
 
 function launchBackend() {
+  if (backendCount >= BACKEND_LIMIT) {
+    console.warn('Concurrent backend limit reached. '
+                 + 'Refusing to launch more processes.')
+  }
   var old_backend = backend
   portfinder.getPort((err, port) => {
     if (err) {
@@ -90,24 +96,23 @@ function launchBackend() {
       pidfile: child_process.execSync('mktemp').toString().trim(),
       port: port
     }
-    self.process = child_process.exec(
-      config.run + ' ' + port + ' ' + self.pidfile,
-      {},
-      (error, stdout, stderr) => {
-        if (error) {
-          console.error('Error running the backend:', error)
-          process.exit(1)
-        } else if (!self.expectToDie) {
-          console.error('Backend exited abnormally. Stdout:')
-          console.error(stdout)
-          console.error('Stderr:')
-          console.error(stderr)
-          process.exit(1)
-        } else {
-          // console.info(`Backend at port ${self.port}, ${self.pidfile} killed`)
-        }
+    var cmd = config.run + ' ' + port + ' ' + self.pidfile
+    self.process = child_process.exec(cmd, (error, stdout, stderr) => {
+      if (error) {
+        console.error('Error running the backend:', error)
+        process.exit(1)
+      } else if (!self.expectToDie) {
+        console.error('Backend exited abnormally. Stdout:')
+        console.error(stdout)
+        console.error('Stderr:')
+        console.error(stderr)
+        process.exit(1)
+      } else {
+        // console.info(`Backend at port ${self.port}, ${self.pidfile} killed`)
       }
-    )
+      backendCount--
+    })
+    backendCount++
 
     // A promise version of fs.readFile
     function readFile(path) {
@@ -170,10 +175,9 @@ var server = http.createServer((req, res) => {
 
 var controlServer = express()
 controlServer.get('/', (req, res) => {
-  res.end('Current backend port: ' + backend.port + '\n')
-})
-controlServer.get('/pid', (req, res) => {
-  res.end('Current backend pidfile: ' + backend.pidfile + '\n')
+  res.write(`Current backend port: ${backend.port}\n`)
+  res.write(`Number of backends: ${backendCount}\n`)
+  res.end()
 })
 controlServer.post('/redeploy/', (req, res) => {
   res.end('Redeploying...\n')
