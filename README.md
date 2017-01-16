@@ -5,7 +5,7 @@ Painless zero-downtime redeploys for simple apps.
 rainbowd.js is a small reverse proxy. You tell it how to launch your app on a
 given port and with a given pidfile, and it will handle gracefully moving
 traffic to a new process and killing the old one when it comes time to
-redeploy. This is still in alpha stages, so proceed at your own risk!
+redeploy. **This is still in alpha stages, so proceed at your own risk!**
 
 The graceful shutdown is enitrely dependent on the underlying webserver
 providing a graceful shutdown.

@@ -1,13 +1,12 @@
 {
-  "name": "rainbowd.js",
-  "version": "1.0.0",
+  "name": "rainbowd",
+  "version": "0.1.1",
   "description": "",
   "main": "rainbowd.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
     "main": "node rainbowd.js"
   },
-  "author": "",
+  "author": "Dan Passaro",
   "license": "ISC",
   "dependencies": {
     "express": "latest"
