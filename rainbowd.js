@@ -180,5 +180,5 @@ fs.readFile(config_path, null,  (err, data) => {
   }
   launchBackend()
   server.listen(7000)
-  controlServer.listen(7001)
+  controlServer.listen(7001, 'localhost')
 })
