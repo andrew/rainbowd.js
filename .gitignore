@@ -1,6 +1,7 @@
 node_modules/
 npm-debug.log
 nohup.out
+*.pid
 
 # Sample project
 sample/virtualenv

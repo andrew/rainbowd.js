@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+#!/usr/bin/env nodejs
 "use strict"
 
 var child_process = require('child_process')
