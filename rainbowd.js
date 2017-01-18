@@ -8,6 +8,7 @@ var http = require('http')
 var express = require('express')
 var httpProxy = require('http-proxy')
 var portfinder = require('portfinder')
+var winston = require('winston')
 
 let config_path = 'rainbow.conf.json'
 let CUTOVER_KILL_DELAY = 5000
@@ -18,10 +19,47 @@ var config = {}
 var backend = null
 var backendCount = 0
 var proxy = httpProxy.createProxyServer()
+var aliveBackends = []
+
+
+var logger = new (winston.Logger)({
+  transports: [
+    new (winston.transports.File)({
+      filename: 'rainbowd.log',
+      json: false
+    })
+  ]
+})
+
+
+// For certain definitions of "safe"
+function safe(callback) {
+  return function() {
+    try {
+      var args = Array.prototype.slice.call(arguments)
+      return callback.apply(callback, args)
+    } catch (exc) {
+      logger.info("Caught error: " + exc)
+    }
+  }
+}
+
+
+function fileContentsSync(path) {
+  return fs.readFileSync(path).toString().trim()
+}
+
+
+// Try to kill any living processes before quitting
+process.on('exit', () => {
+  aliveBackends.forEach(safe(b => b.process.kill()))
+  var pids = aliveBackends.map(safe(b => fileContentsSync(b.pidfile)))
+  pids.forEach(safe(pid => process.kill(pid, 'SIGTERM')))
+})
+
 
 proxy.on('error', (err, req, res) => {
-  res.writeHead(503)
-  res.end("Can't proxy request: " + err)
+  logger.error("Error proxying request: " + err)
 })
 
 
@@ -58,7 +96,7 @@ function healthCheckCutover(backendPort, path, timeout, cutover) {
     successfulChecks++
     attemptedChecks++
     if (successfulChecks >= 3) {
-      console.log("3 checks passed (" + attemptedChecks + " checks made)")
+      logger.info("3 checks passed (" + attemptedChecks + " checks made)")
       startCutover()
     } else {
       check()
@@ -75,7 +113,7 @@ function healthCheckCutover(backendPort, path, timeout, cutover) {
   // Timeout should be something long like 15s
   var fallback = setTimeout(() => {
     if (!cutoverStarted) {
-      console.warn("Timeout passed for checks, cutting over anyway...")
+      logger.warn("Timeout passed for checks, cutting over anyway...")
       startCutover()
     }
   }, timeout)
@@ -98,16 +136,24 @@ function warmupTimeCutover(warmupTime, cutover) {
 }
 
 
+Array.prototype.remove = function(elt) {
+  var index = this.indexOf(elt)
+  if (index >= 0) {
+    this.splice(index, 1)
+  }
+}
+
+
 function launchBackend() {
   if (backendCount >= BACKEND_LIMIT) {
-    console.warn('Concurrent backend limit reached. '
-                 + 'Refusing to launch more processes.')
+    logger.warn('Concurrent backend limit reached. '
+                + 'Refusing to launch more processes.')
   }
   var old_backend = backend
   portfinder.getPort((err, port) => {
     if (err) {
-      console.error("Couldn't find a port:", err)
-      process.exit(1)
+      logger.error("Couldn't find a port:", err)
+      return
     }
 
     var self = {
@@ -119,24 +165,29 @@ function launchBackend() {
     var cmd = config.run + ' ' + port + ' ' + self.pidfile
     self.process = child_process.exec(cmd, (error, stdout, stderr) => {
       self.dead = true
+      aliveBackends.remove(self)
+
+      var unexpectedDeath = error || !self.expectToDie
       if (error) {
-        console.error('Error running the backend:', error)
+        logger.warning('Error running the backend:', error)
       } else if (!self.expectToDie) {
-        console.error('Backend exited abnormally. Stdout:')
-        console.error(stdout)
-        console.error('Stderr:')
-        console.error(stderr)
+        logger.warning('Backend exited abnormally. Stdout:')
+        logger.warning(stdout)
+        logger.warning('Stderr:')
+        logger.warning(stderr)
       } else {
-        // console.info(`Backend at port ${self.port}, ${self.pidfile} killed`)
+        // logger.info(`Backend at port ${self.port}, ${self.pidfile} killed`)
       }
 
       if (self.dead && backend === self) {
         backend = null
       }
-      if (cancelCutover) {
+      if (unexpectedDeath) {
         var msg = backend ? `, staying on port ${backend.port}` : ''
-        console.error('Backend launch failed' + msg)
-        cancelCutover()
+        logger.error('Backend launch failed' + msg)
+        if (cancelCutover) {
+          cancelCutover()
+        }
       }
       backendCount--
     })
@@ -158,11 +209,12 @@ function launchBackend() {
         return
       }
 
+      aliveBackends.push(self)
       readFile(
         self.pidfile
       ).then(pidBuffer => {
         var pid = pidBuffer.toString().trim()
-        console.info(`Switching to backend at port ${self.port}, pid ${pid}`)
+        logger.info(`Switching to backend at port ${self.port}, pid ${pid}`)
       })
 
       backend = self
@@ -180,12 +232,12 @@ function launchBackend() {
           readFile(old_backend.pidfile)
         ).then(data => {
           var pid = data.toString().trim()
-          console.log('Sending TERM to ' + pid)
+          logger.info('Sending TERM to ' + pid)
           old_backend.expectToDie = true
           process.kill(pid, 'SIGTERM')
         }).catch(err => {
           var pidfile = old_backend.pidfile
-          console.error(`Couldn't kill backend at ${pidfile}: ${err}`)
+          logger.error(`Couldn't kill backend at ${pidfile}: ${err}`)
         })
       }
     }
@@ -197,7 +249,7 @@ function launchBackend() {
       cancelCutover = warmupTimeCutover(config.warmupTime, cutover)
     } else {
       // should never happen - config should be validated earlier
-      console.error("No cutover strategy... cutting over in 15s!")
+      logger.warn("No cutover strategy... cutting over in 15s!")
       cancelCutover = warmupTimeCutover(15000, cutover)
     }
   })
@@ -213,11 +265,10 @@ function serveUnavailable(req, res) {
   res.end("Backend unavailable.\n")
 }
 
-
 var server = http.createServer(
   serveUnavailable
 ).on('error', (err, req, res) => {
-  console.error("Unexpected error:", err)
+  logger.error("Unexpected error:", err)
 })
 
 var controlServer = express()

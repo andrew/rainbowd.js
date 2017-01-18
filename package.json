@@ -19,5 +19,6 @@
     "express": "latest"
     ,"http-proxy": "latest"
     ,"portfinder": "latest"
+    ,"winston": "latest"
   }
 }
