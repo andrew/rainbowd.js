@@ -17,9 +17,7 @@ let BACKEND_LIMIT = 10
 // global vars (I know, I'm a bad man)
 var config = {}
 var backend = null
-var backendCount = 0
 var proxy = httpProxy.createProxyServer()
-var aliveBackends = []
 
 
 var logger = new (winston.Logger)({
@@ -66,74 +64,79 @@ proxy.on('error', (err, req, res) => {
 /**
  * Spams GET requests at the backend until 3 pass in a row.
  */
-function healthCheckCutover(backendPort, path, timeout, cutover) {
-  var successfulChecks = 0
-  var attemptedChecks = 0
-  var cutoverStarted = false
-  var request = null;
-  var cutoverCancelled = false
+function HealthCheckCutover(requestOptions) {
+  return {
+    cutover: function(newPort, timeout) {
+      var goodChecks = 0
+      var totalChecks = 0
+      var cutoverStarted = false
+      var cutoverCancelled = false
 
-  function startCutover() {
-    if (!cutoverStarted) {
-      cutoverStarted = true
-      request.end()
-      cutover()
+      var resolve, reject
+      var promise = new Promise((resolver, rejector) => {
+        resolve = resolver
+        reject = rejector
+      })
+
+      function triggerCutover() {
+        if (!cutoverStarted) {
+          cutoverStarted = true
+          request.end()
+          resolve()
+        }
+      }
+
+      var rejectionTimer = setTimeout(() => {
+        if (!cutoverStarted) {
+          logger.warn(
+            "Backend is taking too long to become healthy, cutting over...")
+        }
+        triggerCutover()
+      }, timeout)
+
+      function checkBackend() {
+        if (cutoverCancelled || cutoverStarted) {
+          return
+        }
+        var options = Object.create(requestOptions)
+        options.port = newPort
+        var req = http.get(options, onCheckOk).on('error', onFailedCheck)
+        req.resume()
+      }
+
+      function onOkCheck(req) {
+        req.resume()  // Don't leak memory
+        goodChecks++
+        totalChecks++
+        if (successfulChecks >= 3) {
+          logger.info("3 checks passed (" + attemptedChecks + " checks made)")
+          triggerCutover()
+        } else {
+          checkBackend()
+        }
+      }
+
+      function onFailedCheck() {
+        goodChecks = 0  // want 3 in a row
+        totalChecks++
+        checkBackend()
+      }
+
+      checkBackend()
+      return promise
     }
   }
-
-  function check() {
-    if (cutoverCancelled || cutoverStarted) {
-      return
-    }
-    var req = http.get("http://localhost:" + backendPort + path,
-                       successfulCheck).on('error', failedCheck)
-    if (request == null) {
-      request = req
-    }
-  }
-
-  function successfulCheck(request) {
-    request.resume()  // Don't leak memory
-    successfulChecks++
-    attemptedChecks++
-    if (successfulChecks >= 3) {
-      logger.info("3 checks passed (" + attemptedChecks + " checks made)")
-      startCutover()
-    } else {
-      check()
-    }
-  }
-
-  function failedCheck() {
-    successfulChecks = 0  // want 3 in a row
-    attemptedChecks++
-    check()
-  }
-
-  // Iif the health checks are taking too long, start anyway.
-  // Timeout should be something long like 15s
-  var fallback = setTimeout(() => {
-    if (!cutoverStarted) {
-      logger.warn("Timeout passed for checks, cutting over anyway...")
-      startCutover()
-    }
-  }, timeout)
-  check()
-
-  function cancel() {
-    cutoverCancelled = true
-    clearTimeout(fallback)
-  }
-  return cancel
 }
 
 
-function warmupTimeCutover(warmupTime, cutover) {
-  var timer = setTimeout(() => cutover(), warmupTime)
-  function cancel() {
-    clearTimeout(timer)
+function TimedCutover(warmupTime) {
+  return {
+    cutover: function(doCutover) {
+      var timer = setTimeout(doCutover, warmupTime)
+      cancel = clearTimeout.bind(null, timer)
+      return cancel
+    }
   }
-  return cancel
 }
 
 
@@ -145,117 +148,92 @@ Array.prototype.remove = function(elt) {
 }
 
 
-function launchBackend() {
-  if (backendCount >= BACKEND_LIMIT) {
-    logger.warn('Concurrent backend limit reached. '
-                + 'Refusing to launch more processes.')
-  }
-  var old_backend = backend
-  portfinder.getPort((err, port) => {
-    if (err) {
-      logger.error("Couldn't find a port:", err)
-      return
-    }
-
-    var self = {
-      dead: false,
-      expectToDie: false,
-      pidfile: child_process.execSync('mktemp').toString().trim(),
-      port: port
-    }
-    var cmd = config.run + ' ' + port + ' ' + self.pidfile
-    self.process = child_process.exec(cmd, (error, stdout, stderr) => {
-      self.dead = true
-      aliveBackends.remove(self)
-
-      var unexpectedDeath = error || !self.expectToDie
-      if (error) {
-        logger.warning('Error running the backend:', error)
-      } else if (!self.expectToDie) {
-        logger.warning('Backend exited abnormally. Stdout:')
-        logger.warning(stdout)
-        logger.warning('Stderr:')
-        logger.warning(stderr)
-      } else {
-        // logger.info(`Backend at port ${self.port}, ${self.pidfile} killed`)
-      }
-
-      if (self.dead && backend === self) {
-        backend = null
-      }
-      if (unexpectedDeath) {
-        var msg = backend ? `, staying on port ${backend.port}` : ''
-        logger.error('Backend launch failed' + msg)
-        if (cancelCutover) {
-          cancelCutover()
-        }
-      }
-      backendCount--
-    })
-    backendCount++
-
-    // A promise version of fs.readFile
-    function readFile(path) {
-      return new Promise((resolve, reject) => {
-        fs.readFile(path, (err, data) => {
-          err ? reject(err) : resolve(data)
-        })
-      })
-    }
-
-    function cutover() {
-
-      // Did the backend fail to start?  If so don't try to bring it online
-      if (self.dead) {
-        return
-      }
-
-      aliveBackends.push(self)
-      readFile(
-        self.pidfile
-      ).then(pidBuffer => {
-        var pid = pidBuffer.toString().trim()
-        logger.info(`Switching to backend at port ${self.port}, pid ${pid}`)
-      })
-
-      backend = self
-      if (server.listeners('request').indexOf(serveUnavailable) >= 0) {
-        server.removeListener('request', serveUnavailable)
-        server.on('request', serveBackend)
-      }
-
-      if (old_backend !== null) {
-
-        // TODO: check it actually dies (SIGTERM can be ignored)
-        new Promise((resolve, reject) => {
-          setTimeout(() => resolve(), CUTOVER_KILL_DELAY)
-        }).then(() =>
-          readFile(old_backend.pidfile)
-        ).then(data => {
-          var pid = data.toString().trim()
-          logger.info('Sending TERM to ' + pid)
-          old_backend.expectToDie = true
-          process.kill(pid, 'SIGTERM')
-        }).catch(err => {
-          var pidfile = old_backend.pidfile
-          logger.error(`Couldn't kill backend at ${pidfile}: ${err}`)
-        })
-      }
-    }
-
-    var cancelCutover = null
-    if (config.healthCheckPath) {
-      cancelCutover = healthCheckCutover(port, config.healthCheckPath, 15000, cutover)
-    } else if (config.warmupTime) {
-      cancelCutover = warmupTimeCutover(config.warmupTime, cutover)
-    } else {
-      // should never happen - config should be validated earlier
-      logger.warn("No cutover strategy... cutting over in 15s!")
-      cancelCutover = warmupTimeCutover(15000, cutover)
-    }
+/**
+ * Promise-ified version of portfinder.getPort()
+ */
+function getOpenPort() {
+  return new Promise((resolve, reject) => {
+    portFinder.getPort((err, port) => err ? reject(err) : resolve(port))
   })
 }
 
+
+/**
+ * Promisified child_process.exec()
+ */
+function exec(cmd) {
+  return new Promise((resolve, reject) => {
+    child_process.exec(cmd, (error, stdout, stderr) => {
+      if (error) {
+        reject(error)
+      } else {
+        resolve([stdout, stderr])
+      }
+    })
+  })
+}
+
+/**
+ * Launches and tracks backend instances.
+ *
+ * With the help of a cutoverManager, provides the smooth redeploys.
+ */
+function RainbowManager(cutoverManager, backendConfig) {
+  var backendCount = 0
+  var backends = []
+  var activeBackend = null
+
+  function Backend() {
+    var dead = false
+    var expectToDie = false
+    var process = null
+    var port = port
+
+    return getOpenPort().then(port => {
+      process = spawn(
+        backendConfig.command,
+        backendConfig.args + [port],
+        {
+          stdio: 'inherit',
+        }
+      )
+      return {
+        get port() { return port },
+        get process() { return process },
+      }
+    })
+  }
+
+  return {
+
+    /**
+     * Launch a backend and, once it's safe, activate it.
+     *
+     * Once the new one is launched, the old one is killed gracefully.
+     */
+    launch: function() {
+      if (backendCount >= BACKEND_LIMIT) {
+        logger.warn(`Backend limit ${BACKEND_LIMIT} reached. Refusing deploy.`)
+        return
+      }
+
+      var newBackend = null
+      Backend().then(backend => {
+        backends.push(backend)
+        newBackend = backend
+        return cutover(backend.port, backend.on.bind(null, 'error'))
+      }).then(
+        () => {
+          var oldBackend = activeBackend
+          activeBackend = newBackend
+          oldBackend.shutdown()
+        },
+        (err) => {
+          logger.error('Deploy failed:', err)
+        })
+    }
+  }
+}
 
 function serveBackend(req, res) {
   proxy.web(req, res, {target: 'http://localhost:' + backend.port})
@@ -290,6 +268,13 @@ function die(msg) {
 }
 
 
+function setDefault(obj, key, defaultVal) {
+  if (obj[key] === undefined) {
+    obj[key] = defaultVal
+  }
+}
+
+
 fs.readFile(config_path, null,  (err, data) => {
   if (err) {
     die("Couldn't read " + config_path + ": " + err)
@@ -300,11 +285,22 @@ fs.readFile(config_path, null,  (err, data) => {
     die("Couldn't parse " + config_path + ": " + err)
   }
 
-  if (config.warmupTime && config.healthCheckPath) {
-    die("Set either warmupTime or healthCheckPath, not both")
-  } else if (!(config.warmupTime || config.healthCheckPath)) {
-    die("Need warmupTime or healthCheckPath")
+  var isHealthCheck = config.healthCheck !== undefined
+  var isWarmup = config.warmupTime !== undefined
+  if (isWarmup && isHealthCheck) {
+    die("Set either warmupTime or healthCheck, not both")
+  } else if (!isWarmup && !isHealthCheckConfig) {
+    die("Need warmupTime or healthCheck")
   }
+
+  if (isHealthCheck) {
+    var requestOptions = config.healthCheck
+    setDefault(requestOptions, 'host', 'localhost')
+    cutoverOrchestrator = HealthCheckCutover(requestOptions)
+  } else if(isWarmup) {
+    cutoverOrchestrator = TimedCutover(config.warmupTime)
+  }
+
   launchBackend()
   var port = config.port || 7000
   var controlPort = config.controlPort || port + 1
