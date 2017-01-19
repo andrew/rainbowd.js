@@ -305,6 +305,9 @@ fs.readFile(config_path, null,  (err, data) => {
     die("Need warmupTime or healthCheckPath")
   }
   launchBackend()
-  server.listen(7000, 'localhost')
-  controlServer.listen(7001, 'localhost')
+  var port = config.port || 7000
+  var controlPort = config.controlPort || port + 1
+  server.listen(port, 'localhost')
+  controlServer.listen(controlPort, 'localhost')
+  logger.info(`Listening on ${port}, control on ${controlPort}`)
 })
