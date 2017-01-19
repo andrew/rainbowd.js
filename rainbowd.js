@@ -92,7 +92,8 @@ function healthCheckCutover(backendPort, path, timeout, cutover) {
     }
   }
 
-  function successfulCheck() {
+  function successfulCheck(request) {
+    request.resume()  // Don't leak memory
     successfulChecks++
     attemptedChecks++
     if (successfulChecks >= 3) {
