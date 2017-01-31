@@ -1,4 +1,11 @@
 {
-  "run": "sh run.sh",
-  "healthCheckPath": "/"
+  "app": {
+    "command": "sh",
+    "commandArgs": ["run.sh"],
+    "port": "7000",
+    "cutover": {
+      "type": "WarmupTimer",
+      "time": "1000"
+    }
+  }
 }

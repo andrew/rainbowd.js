@@ -14,11 +14,6 @@ let config_path = 'rainbow.conf.json'
 let CUTOVER_KILL_DELAY = 5000
 let BACKEND_LIMIT = 10
 
-// global vars (I know, I'm a bad man)
-var config = {}
-var backend = null
-var proxy = httpProxy.createProxyServer()
-
 
 var logger = new (winston.Logger)({
   transports: [
@@ -46,19 +41,6 @@ function safe(callback) {
 function fileContentsSync(path) {
   return fs.readFileSync(path).toString().trim()
 }
-
-
-// Try to kill any living processes before quitting
-process.on('exit', () => {
-  aliveBackends.forEach(safe(b => b.process.kill()))
-  var pids = aliveBackends.map(safe(b => fileContentsSync(b.pidfile)))
-  pids.forEach(safe(pid => process.kill(pid, 'SIGTERM')))
-})
-
-
-proxy.on('error', (err, req, res) => {
-  logger.error("Error proxying request: " + err)
-})
 
 
 /**
@@ -131,11 +113,9 @@ function HealthCheckCutover(requestOptions) {
 
 function TimedCutover(warmupTime) {
   return {
-    cutover: function(doCutover) {
-      var timer = setTimeout(doCutover, warmupTime)
-      cancel = clearTimeout.bind(null, timer)
-      return cancel
-    }
+    cutover: () => new Promise((resolve, reject) => {
+      setTimeout(resolve.bind(null), warmupTime)
+    })
   }
 }
 
@@ -153,7 +133,7 @@ Array.prototype.remove = function(elt) {
  */
 function getOpenPort() {
   return new Promise((resolve, reject) => {
-    portFinder.getPort((err, port) => err ? reject(err) : resolve(port))
+    portfinder.getPort((err, port) => err ? reject(err) : resolve(port))
   })
 }
 
@@ -173,12 +153,55 @@ function exec(cmd) {
   })
 }
 
+
+function serveUnavailable(req, res) {
+  res.statusCode = 503
+  res.end("Backend unavailable.\n")
+}
+
+
+let CutoverTypes = {
+  HealthCheck: HealthCheckCutover,
+  WarmupTimer: TimedCutover,
+}
+
+
+function makeCutover(cutoverConfig) {
+  var errors = []
+  var type = cutoverConfig.type
+  if (!type) {
+    errors.push("Need 'cutover.type'")
+  }
+  if (!CutoverTypes.hasOwnProperty(type)) {
+    var allTypes = Object.keys(CutoverTypes).join(', ')
+    errors.push(`Unrecognized cutover type '${type}'. Options: ${allTypes}`)
+    throw ConfigError(errors)
+  }
+  delete cutoverConfig.type
+  var constructor = CutoverTypes[type]
+  var cutover
+  try {
+    cutover = constructor(cutoverConfig)
+  } catch (exception) {
+    if (exception.messages) {
+      errors = errors.concat(exception.messages)
+    } else {
+      throw exception
+    }
+  }
+  if (errors.length > 0) {
+    throw ConfigError(errors)
+  }
+  return cutover
+}
+
+
 /**
  * Launches and tracks backend instances.
  *
  * With the help of a cutoverManager, provides the smooth redeploys.
  */
-function RainbowManager(cutoverManager, backendConfig) {
+function RainbowManager(command, commandArgs, bindAddress, bindPort, cutover) {
   var backendCount = 0
   var backends = []
   var activeBackend = null
@@ -190,9 +213,10 @@ function RainbowManager(cutoverManager, backendConfig) {
     var port = port
 
     return getOpenPort().then(port => {
-      process = spawn(
-        backendConfig.command,
-        backendConfig.args + [port],
+      var cmdArgs = commandArgs.concat([port])
+      process = child_process.spawn(
+        command,
+        cmdArgs,
         {
           stdio: 'inherit',
         }
@@ -200,18 +224,52 @@ function RainbowManager(cutoverManager, backendConfig) {
       return {
         get port() { return port },
         get process() { return process },
+        on: (...args) => process.on(args),
       }
     })
   }
 
-  return {
+  var proxy = httpProxy.createProxyServer()
+
+  proxy.on('error', (err, req, res) => {
+    logger.error("Error proxying request: " + err)
+  })
+
+  function proxyBackend(req, res) {
+    proxy.web(req, res, {target: 'http://' + bindAddress + ':' + backend.port})
+  }
+
+  var server = http.createServer(
+    serveUnavailable
+  ).on('error', (err, req, res) => {
+    logger.error("Unexpected error:", err)
+  })
+
+  // ** INITIALIZATION **
+  server.listen(bindPort, bindAddress).on('error', (err) => {
+    logger.error(`Failed to listen to ${bindAddress}:${bindPort} - `, err)
+  })
+  logger.info(`Listening on ${bindAddress}:${bindPort}`)
+
+  // If the process ends, try and kill all backends that are alive.
+  process.on('exit', () => {
+    backends.forEach(safe(b => b.process.kill()))
+    var pids = backends.map(safe(b => fileContentsSync(b.pidfile)))
+    pids.forEach(safe(pid => process.kill(pid, 'SIGTERM')))
+  })
+
+  function serveBackend(req, res) {
+    proxy.web(req, res, {target: 'http://localhost:' + activeBackend.port})
+  }
+
+  var self = {
 
     /**
      * Launch a backend and, once it's safe, activate it.
      *
      * Once the new one is launched, the old one is killed gracefully.
      */
-    launch: function() {
+    deploy: function() {
       if (backendCount >= BACKEND_LIMIT) {
         logger.warn(`Backend limit ${BACKEND_LIMIT} reached. Refusing deploy.`)
         return
@@ -221,34 +279,68 @@ function RainbowManager(cutoverManager, backendConfig) {
       Backend().then(backend => {
         backends.push(backend)
         newBackend = backend
-        return cutover(backend.port, backend.on.bind(null, 'error'))
-      }).then(
-        () => {
-          var oldBackend = activeBackend
-          activeBackend = newBackend
+        return cutover.cutover(backend.on.bind(null, 'error'))
+      }).then(() => {
+        var oldBackend = activeBackend
+        activeBackend = newBackend
+        if (oldBackend === null) {
+          server.removeListener('request', serveUnavailable)
+          server.on('request', serveBackend)
+        } else {
           oldBackend.shutdown()
-        },
-        (err) => {
-          logger.error('Deploy failed:', err)
-        })
+        }
+      }).catch(err => {
+        logger.error('Deploy failed:', err)
+      })
+    }
+  }
+  self.deploy()
+  return self
+}
+
+
+function ConfigError(messages) {
+  return {
+    name: 'ConfigError',
+    messages: messages,
+    toString: function() {
+      var msgs = messages.map(s => `"${s}"`).join(', ')
+      return `ConfigError(${msgs})`
     }
   }
 }
 
-function serveBackend(req, res) {
-  proxy.web(req, res, {target: 'http://localhost:' + backend.port})
+
+RainbowManager.fromConfig = function(config) {
+  var errors = []
+  let requiredOptions = ['command', 'port', 'cutover']
+  requiredOptions.forEach(option => {
+    if (!config[option]) {
+      errors.push(`Need '${option}'`)
+    }
+  })
+  var cutover
+  if (config.cutover) {
+    try {
+      cutover = makeCutover(config.cutover)
+    } catch (exception) {
+      if (exception.messages) {
+        errors = errors.concat(exception.messages)
+      } else {
+        throw exception
+      }
+    }
+  }
+  if (errors.length > 0) {
+    throw ConfigError(errors)
+  }
+  return RainbowManager(config.command,
+                        config.commandArgs || [],
+                        config.bindAddress || 'localhost',
+                        config.port,
+                        cutover)
 }
 
-function serveUnavailable(req, res) {
-  res.statusCode = 503
-  res.end("Backend unavailable.\n")
-}
-
-var server = http.createServer(
-  serveUnavailable
-).on('error', (err, req, res) => {
-  logger.error("Unexpected error:", err)
-})
 
 var controlServer = express()
 controlServer.get('/', (req, res) => {
@@ -262,8 +354,8 @@ controlServer.post('/redeploy/', (req, res) => {
 })
 
 
-function die(msg) {
-  console.error(msg)
+function die(...args) {
+  console.error(...args)
   process.exit(1)
 }
 
@@ -275,36 +367,24 @@ function setDefault(obj, key, defaultVal) {
 }
 
 
+var rainbowInstances = {}
+
+
 fs.readFile(config_path, null,  (err, data) => {
   if (err) {
     die("Couldn't read " + config_path + ": " + err)
   }
   try {
-    config = JSON.parse(data)
-  } catch (ex) {
-    die("Couldn't parse " + config_path + ": " + err)
+    var config = JSON.parse(data)
+  } catch (exception) {
+    die("Couldn't parse " + config_path + ":", exception)
   }
 
-  var isHealthCheck = config.healthCheck !== undefined
-  var isWarmup = config.warmupTime !== undefined
-  if (isWarmup && isHealthCheck) {
-    die("Set either warmupTime or healthCheck, not both")
-  } else if (!isWarmup && !isHealthCheckConfig) {
-    die("Need warmupTime or healthCheck")
-  }
+  Object.entries(config).forEach(([key, val]) => {
+    rainbowInstances[key] = RainbowManager.fromConfig(val)
+  })
 
-  if (isHealthCheck) {
-    var requestOptions = config.healthCheck
-    setDefault(requestOptions, 'host', 'localhost')
-    cutoverOrchestrator = HealthCheckCutover(requestOptions)
-  } else if(isWarmup) {
-    cutoverOrchestrator = TimedCutover(config.warmupTime)
-  }
-
-  launchBackend()
-  var port = config.port || 7000
-  var controlPort = config.controlPort || port + 1
-  server.listen(port, 'localhost')
+  var controlPort = config.controlPort || 7021
   controlServer.listen(controlPort, 'localhost')
-  logger.info(`Listening on ${port}, control on ${controlPort}`)
+  logger.info(`Control server listening on ${controlPort}`)
 })
