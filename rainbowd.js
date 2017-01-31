@@ -15,6 +15,10 @@ let CUTOVER_KILL_DELAY = 5000
 let BACKEND_LIMIT = 10
 
 
+// Holds all running proxy servers
+var rainbowInstances = {}
+
+
 var logger = new (winston.Logger)({
   transports: [
     new (winston.transports.File)({
@@ -225,6 +229,7 @@ function RainbowManager(command, commandArgs, bindAddress, bindPort, cutover) {
         get port() { return port },
         get process() { return process },
         on: (...args) => process.on(args),
+        shutdown: () => process.kill('SIGTERM'),
       }
     })
   }
@@ -292,6 +297,15 @@ function RainbowManager(command, commandArgs, bindAddress, bindPort, cutover) {
       }).catch(err => {
         logger.error('Deploy failed:', err)
       })
+    },
+
+    get listenPort() { return bindPort },
+    get backendPort() {
+      if (activeBackend !== null) {
+        return activeBackend.port
+      } else {
+        return 'None'
+      }
     }
   }
   self.deploy()
@@ -342,16 +356,32 @@ RainbowManager.fromConfig = function(config) {
 }
 
 
+function appHandler(func) {
+  return function (req, res) {
+    var app = rainbowInstances[req.params.app]
+    if (typeof app === 'undefined') {
+      res.status(404).send('App not found')
+      return
+    }
+    return func(req, res, app)
+  }
+}
+
+
 var controlServer = express()
 controlServer.get('/', (req, res) => {
-  res.write(`Current backend port: ${backend.port}\n`)
-  res.write(`Number of backends: ${backendCount}\n`)
+  var apps = Object.keys(rainbowInstances).join(', ')
+  res.send(`Apps: ${apps}\n`)
+})
+controlServer.get('/:app', appHandler((req, res, app) => {
+  res.write(`Backend port: ${app.backendPort}\n`)
+  res.write(`Frontend port: ${app.listenPort}\n`)
   res.end()
-})
-controlServer.post('/redeploy/', (req, res) => {
-  res.end('Redeploying...\n')
-  launchBackend()
-})
+}))
+controlServer.post('/:app/redeploy', appHandler((req, res, app) => {
+  res.end(`Redeploying ${app.name}...`)
+  app.deploy()
+}))
 
 
 function die(...args) {
@@ -365,9 +395,6 @@ function setDefault(obj, key, defaultVal) {
     obj[key] = defaultVal
   }
 }
-
-
-var rainbowInstances = {}
 
 
 fs.readFile(config_path, null,  (err, data) => {
